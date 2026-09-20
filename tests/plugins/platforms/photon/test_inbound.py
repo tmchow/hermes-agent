@@ -13,8 +13,10 @@ from typing import Any, Dict, List
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.profile_routing import parse_profile_routes
+from gateway.session_identity import identity_of
 from plugins.platforms.photon.adapter import PhotonAdapter
 
 
@@ -111,15 +113,63 @@ _PNG_1X1_B64 = (
 
 
 def _attachment_event(
-    content: Dict[str, Any], msg_id: str = "spc-msg-att"
+    content: Dict[str, Any], msg_id: str = "spc-msg-att", chat_id: str = "+155****4567"
 ) -> Dict[str, Any]:
     return {
         "messageId": msg_id,
-        "space": {"id": "+15551234567", "type": "dm", "phone": "+15551234567"},
-        "sender": {"id": "+15551234567"},
+        "space": {"id": chat_id, "type": "dm", "phone": chat_id},
+        "sender": {"id": chat_id},
         "content": {"type": "attachment", **content},
         "timestamp": "2026-05-14T19:06:32.000Z",
     }
+
+
+def _configure_multiplex_runner(
+    adapter: PhotonAdapter,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    route_profile: str = "secondary-profile",
+    serve_route_profile: bool = True,
+) -> None:
+    """Attach the real current-main identity resolver to a Photon adapter."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.config.platforms = {Platform("photon"): adapter.config}
+    runner.config.profile_routes = parse_profile_routes(
+        [{
+            "name": "photon-secondary",
+            "platform": "photon",
+            "profile": route_profile,
+            "chat_id": "secondary-chat",
+        }]
+    )
+    runner._primary_profile_name = "default"
+    runner.adapters = {Platform("photon"): adapter}
+    runner._profile_adapters = {route_profile: {}} if serve_route_profile else {}
+    monkeypatch.setattr(adapter, "gateway_runner", runner)
+
+    served_names = {"default"}
+    if serve_route_profile:
+        served_names.add(route_profile)
+    served = [
+        (name, root if name == "default" else root / "profiles" / name)
+        for name in sorted(served_names)
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex=False: served,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: root if name == "default" else root / "profiles" / name,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda name: name in served_names,
+    )
 
 
 def _voice_event(
@@ -132,6 +182,162 @@ def _voice_event(
         "content": {"type": "voice", **content},
         "timestamp": "2026-05-14T19:06:32.000Z",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "mime", "raw"),
+    [
+        (
+            "score.png",
+            "image/png",
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYA"
+                "AjCB0C8AAAAASUVORK5CYII="
+            ),
+        ),
+        (
+            "score.heic",
+            "image/heic",
+            b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 32,
+        ),
+    ],
+)
+async def test_routed_attachment_cached_under_destination_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    mime: str,
+    raw: bytes,
+) -> None:
+    """A shared Photon listener must cache bytes under the routed profile.
+
+    The source profile is known before normalization. Caching under the
+    gateway's launch/default home leaves a Docker-isolated child profile with
+    a path its image resolver must reject, even though the attachment belongs
+    to that profile's current conversation.
+    """
+    root = tmp_path / "hermes"
+    secondary_home = root / "profiles" / "secondary-profile"
+    secondary_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    adapter = _make_adapter(monkeypatch)
+    _configure_multiplex_runner(adapter, root, monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+
+    async def send_default(label: str) -> None:
+        payload = f"default-{label}".encode()
+        await adapter._dispatch_inbound(
+            _attachment_event(
+                {
+                    "name": f"{label}.txt",
+                    "mimeType": "text/plain",
+                    "size": len(payload),
+                    "data": base64.b64encode(payload).decode("ascii"),
+                    "encoding": "base64",
+                },
+                msg_id=f"default-{label}",
+                chat_id=f"default-{label}",
+            )
+        )
+
+    await send_default("before")
+    event = _attachment_event(
+        {
+            "name": name,
+            "mimeType": mime,
+            "size": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+        },
+        chat_id="secondary-chat",
+    )
+
+    await adapter._dispatch_inbound(event)
+    await send_default("after")
+
+    assert len(captured) == 3
+    default_before, routed, default_after = captured
+    identities = [identity_of(item.source) for item in captured]
+    assert all(identity is not None for identity in identities)
+    assert [identity.runtime_profile for identity in identities if identity is not None] == [
+        "default",
+        "secondary-profile",
+        "default",
+    ]
+    for item in (default_before, default_after):
+        assert Path(item.media_urls[0]).resolve().is_relative_to((root / "cache").resolve())
+
+    identity = identities[1]
+    assert identity is not None
+    assert (identity.transport_profile, identity.runtime_profile) == (
+        "default",
+        "secondary-profile",
+    )
+    assert identity.runtime_home == secondary_home
+    assert len(routed.media_urls) == 1
+    cached = Path(routed.media_urls[0]).resolve()
+    assert cached.is_relative_to(secondary_home.resolve())
+    assert cached.read_bytes() == raw
+    assert not (root / "cache" / "images" / cached.name).exists()
+
+    # A Docker-isolated secondary can inspect and edit the current attachment
+    # without receiving general host-file access or an active sandbox session.
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.image_source import ResolveContext, resolve_image_source, resolve_local_source_to_data_url
+
+    token = set_hermes_home_override(str(secondary_home))
+    try:
+        resolved = await resolve_image_source(str(cached), ResolveContext(task_id="never-started"))
+        edit_source = await resolve_local_source_to_data_url(str(cached), task_id="never-started")
+    finally:
+        reset_hermes_home_override(token)
+    assert resolved.data == raw
+    assert base64.b64decode(edit_source.partition(",")[2]) == raw
+
+
+@pytest.mark.asyncio
+async def test_unserved_routed_attachment_is_dropped_before_cache_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale route cannot persist bytes or recreate its deleted profile."""
+    root = tmp_path / "hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    adapter = _make_adapter(monkeypatch)
+    _configure_multiplex_runner(
+        adapter,
+        root,
+        monkeypatch,
+        route_profile="deleted-profile",
+        serve_route_profile=False,
+    )
+    captured = _capture(adapter, monkeypatch)
+    raw = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYA"
+        "AjCB0C8AAAAASUVORK5CYII="
+    )
+
+    await adapter._dispatch_inbound(
+        _attachment_event(
+            {
+                "name": "late.png",
+                "mimeType": "image/png",
+                "size": len(raw),
+                "data": base64.b64encode(raw).decode("ascii"),
+                "encoding": "base64",
+            },
+            chat_id="secondary-chat",
+        )
+    )
+
+    assert captured == []
+    assert not (root / "cache").exists()
+    assert not (root / "profiles" / "deleted-profile").exists()
 
 
 @pytest.mark.asyncio

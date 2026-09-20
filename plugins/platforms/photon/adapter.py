@@ -449,6 +449,34 @@ def _normalize_content(content: Dict[str, Any]) -> _Normalized:
     return normalize(content)
 
 
+async def _normalize_content_for_source(
+    content: Dict[str, Any],
+    profile_home: Optional[Path] = None,
+) -> _Normalized:
+    """Normalize inbound content under the routed profile's cache authority.
+
+    Photon receives all multiplexed traffic on one shared listener, before the
+    gateway enters the destination profile's turn scope.  ``build_source`` has
+    already resolved that destination, so copy its HERMES_HOME override into
+    the worker used for base64 decoding/cache writes.  This keeps current-turn
+    media readable by a Docker-isolated child profile without granting it host
+    access to the default profile's cache.
+    """
+    if content.get("type") not in _BINARY_CONTENT_TYPES:
+        return _normalize_content(content)
+    if profile_home is None:
+        return await asyncio.to_thread(_normalize_content, content)
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        # asyncio.to_thread copies ContextVars, including the profile home.
+        return await asyncio.to_thread(_normalize_content, content)
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _attachment_body(space_id: str, safe_path: str, *, kind: str, name: Optional[str] = None,
                      mime_type: Optional[str] = None, caption: Optional[str] = None) -> Dict[str, Any]:
     """``/send-attachment`` body; spectrum-ts infers name/mimeType from the extension,
@@ -742,10 +770,18 @@ class PhotonAdapter(BasePlatformAdapter):
         message_id = event.get("messageId")
         ctype = content.get("type")
 
+        source = None
+
+        def _source():
+            nonlocal source
+            if source is None:
+                source = self.build_source(chat_id=space_id, chat_name=space_id, chat_type=chat_type,
+                                           user_id=sender_id, user_name=sender_id or None,
+                                           message_id=message_id)
+            return source
+
         def _event(text: str, mtype: MessageType = MessageType.TEXT, **kwargs: Any) -> MessageEvent:
-            source = self.build_source(chat_id=space_id, chat_name=space_id, chat_type=chat_type,
-                                       user_id=sender_id, user_name=sender_id or None, message_id=message_id)
-            return MessageEvent(text=text, message_type=mtype, source=source, message_id=message_id,
+            return MessageEvent(text=text, message_type=mtype, source=_source(), message_id=message_id,
                                 raw_message=event, timestamp=timestamp, **kwargs)
         if ctype in {"read", "read_receipt"}:  # presence signal, not a user turn (receipts for our sends)
             logger.debug("[photon] outbound message read: %s", content.get("targetMessageId") or "unknown")
@@ -802,8 +838,19 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.debug("[photon] ignoring group message (require_mention=true, no mention pattern matched)")
             return
         if ctype in _BINARY_CONTENT_TYPES:
-            # Base64 decode + media-cache write of possibly multi-MB payloads — keep it off the event loop.
-            text, mtype, media_urls, media_types = await asyncio.to_thread(_normalize_content, content)
+            # Base64 decode + media-cache write of possibly multi-MB payloads
+            # stays off-loop and, under multiplex routing, inside the
+            # destination profile's cache authority.
+            source = _source()
+            identity = self._canonicalize(source)
+            # Canonical identity is the ingress authority. A rejected route
+            # must be dropped before attacker-controlled bytes are persisted.
+            if identity is None and self._drop_unresolved(_event("")):
+                return
+            text, mtype, media_urls, media_types = await _normalize_content_for_source(
+                content,
+                getattr(identity, "runtime_home", None),
+            )
         else:
             text, mtype, media_urls, media_types = _normalize_content(content)
         if gated:
